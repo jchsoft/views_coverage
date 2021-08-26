@@ -1,26 +1,67 @@
 module Minitest
   class ViewsCoverage < AbstractReporter
     NO_TEMPLATE_IDENTIFIERS = ['html template', 'text template'].freeze
+    RESULT_FILENAME_PREFIX = 'views_coverage_result_'.freeze
+    MERGE_MODE_FLAG = 'merge'.freeze
 
     def initialize(options)
+      super()
       @mode = options.delete(:mode) || 'clean'
-      @@coverage_result = Hash.new.tap do |hash|
-        NO_TEMPLATE_IDENTIFIERS.each { |id| hash[id] = 0 }
-        Dir.glob('app/views/**/*.*').each { |file_path| hash[file_path] = 0 }
-      end
-      merge_previous_test_result if @mode == 'merge'
+      @coverage_result = {}
       subscribe_to_notifications
     end
 
-    def report
-      called_views = @@coverage_result.select { |path, count| count > 0 }
-      not_called_views = @@coverage_result.select { |path, count| count.zero? }
+    def prerecord(klass, _name)
+      @test_type = klass < ActionDispatch::SystemTestCase ? :system : :unit
+    end
 
-      File.open('view_coverage_result.yml', 'w') do |file|
-        file.write(YAML.dump(@@coverage_result))
+    def report
+      write_result(@coverage_result[:unit], :unit) if @coverage_result[:unit].present?
+      write_result(@coverage_result[:system], :system) if @coverage_result[:system].present?
+      write_merged_result if @mode == MERGE_MODE_FLAG
+    end
+
+    private
+
+    def subscribe_to_notifications
+      %w[render_template.action_view render_partial.action_view render_collection.action_view].each do |event_name|
+        ActiveSupport::Notifications.subscribe event_name do |_name, _start, _finish, _id, payload|
+          @coverage_result[@test_type] ||= prepare_result_hash
+          @coverage_result[@test_type][payload[:identifier].delete_prefix("#{::Rails.root.to_s}/")] += 1
+        end
+      end
+    end
+
+    def write_merged_result
+      if @coverage_result[:system].present?
+        result = merge_results(current_result: @coverage_result[:system], previous_test_type: :unit)
+      else
+        result = merge_results(current_result: @coverage_result[:unit], previous_test_type: :system)
+      end
+      write_result(result, :merged)
+    end
+
+    def merge_results(current_result:, previous_test_type:)
+      previous_result = YAML.load_file("#{RESULT_FILENAME_PREFIX}#{previous_test_type}.yml")
+      current_result.merge(previous_result) { |_path, previous_count, current_count| previous_count + current_count }
+    end
+
+    def prepare_result_hash
+      {}.tap do |hash|
+        NO_TEMPLATE_IDENTIFIERS.each { |identifier| hash[identifier] = 0 }
+        Dir.glob('app/views/**/*.*').each { |file_path| hash[file_path] = 0 }
+      end
+    end
+
+    def write_result(result, type)
+      File.open("#{RESULT_FILENAME_PREFIX}#{type}.yml", 'w') do |file|
+        file.write(YAML.dump(result))
       end
 
-      file = File.new("view_coverage_pp.txt", 'a')
+      called_views = result.select { |_, count| count.positive? }
+      not_called_views = result.select { |_, count| count.zero? }
+
+      file = File.new("#{RESULT_FILENAME_PREFIX}#{type}_pretty.txt", 'w')
       file.write("=============== Not called ===============\n")
       not_called_views.keys.sort.each { |path| file.write("#{path}\n") }
 
@@ -32,25 +73,8 @@ module Minitest
       file.write("=============== Summary ===============\n")
       file.write("Uncalled: #{not_called_views.length}\n")
       file.write("Called: #{called_views.length}\n")
-      file.write("Coverage %: #{((called_views.length.to_d / @@coverage_result.length) * 100).to_s}")
+      file.write("Coverage %: #{((called_views.length.to_d / result.length) * 100).to_s}")
       file.close
-    end
-
-    private
-
-    def subscribe_to_notifications
-      %w[render_template.action_view render_partial.action_view render_collection.action_view].each do |event_name|
-        ActiveSupport::Notifications.subscribe event_name do |_name, _start, _finish, _id, payload|
-          @@coverage_result[payload[:identifier].delete_prefix("#{::Rails.root.to_s}/")] += 1
-        end
-      end
-    end
-
-    def merge_previous_test_result
-      return if @merged_test_results
-
-      YAML.load_file('view_coverage_result.yml').each { |path, count| @@coverage_result[path] = count }
-      @merged_test_results = true
     end
   end
 
